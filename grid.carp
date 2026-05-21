@@ -1,0 +1,210 @@
+(load "../carp-geometry/geometry.carp")
+(use Geometry)
+(use Array)
+(use Double)
+
+(doc SpatialGrid "is a static 3D spatial partitioning grid.")
+(deftype SpatialGrid [
+  cell-size Double
+  cols Int
+  rows Int
+  layers Int
+  buckets (Array (Array Int))
+])
+
+(defmodule SpatialGrid
+  (defn- pos-to-coord [grid p]
+    (let [cs @(SpatialGrid.cell-size grid)]
+      (Vector3.init (floor (/ @(Vector3.x p) cs))
+                    (floor (/ @(Vector3.y p) cs))
+                    (floor (/ @(Vector3.z p) cs)))))
+
+  (defn- get-index [grid x y z]
+    (let [cols @(SpatialGrid.cols grid)
+          rows @(SpatialGrid.rows grid)
+          layers @(SpatialGrid.layers grid)]
+      (if (and (and (and (>= x 0) (< x cols))
+                    (and (>= y 0) (< y rows)))
+               (and (>= z 0) (< z layers)))
+        (Maybe.Just (+ x (* cols (+ y (* rows z)))))
+        (Maybe.Nothing))))
+
+  (doc new "creates a new static SpatialGrid.")
+  (defn new [cell-size cols rows layers]
+    (let [total (* cols (* rows layers))
+          buckets (Array.replicate total &(the (Array Int) []))]
+      (SpatialGrid.init cell-size cols rows layers buckets)))
+
+  (doc length "returns the total number of cells in the grid.")
+  (defn length [grid]
+    (* @(SpatialGrid.cols grid) (* @(SpatialGrid.rows grid) @(SpatialGrid.layers grid))))
+
+  (doc empty? "checks whether all buckets in the grid are empty.")
+  (defn empty? [grid]
+    (let [buckets (SpatialGrid.buckets grid)
+          res true]
+      (do
+        (for [i 0 (Array.length buckets)]
+          (when (not (Array.empty? (Array.unsafe-nth buckets i)))
+            (do (set! res false) (break))))
+        res)))
+
+  (doc insert! "inserts an object ID into the grid buckets overlapping the AABB.")
+  (defn insert! [grid aabb id]
+    (let [amin (AABB.min aabb)
+          amax (AABB.max aabb)
+          cmin (pos-to-coord grid amin)
+          cmax (pos-to-coord grid amax)
+          buckets (SpatialGrid.buckets grid)]
+      (for [z (to-int @(Vector3.z &cmin)) (inc (to-int @(Vector3.z &cmax)))]
+        (for [y (to-int @(Vector3.y &cmin)) (inc (to-int @(Vector3.y &cmax)))]
+          (for [x (to-int @(Vector3.x &cmin)) (inc (to-int @(Vector3.x &cmax)))]
+            (match (get-index grid x y z)
+              (Maybe.Just idx) (Array.push-back! (Array.unsafe-nth buckets idx) id)
+              (Maybe.Nothing) ()))))))
+
+  (doc remove! "removes an object ID from the buckets overlapping the AABB.")
+  (defn remove! [grid aabb id]
+    (let [amin (AABB.min aabb)
+          amax (AABB.max aabb)
+          cmin (pos-to-coord grid amin)
+          cmax (pos-to-coord grid amax)
+          buckets (SpatialGrid.buckets grid)]
+      (for [z (to-int @(Vector3.z &cmin)) (inc (to-int @(Vector3.z &cmax)))]
+        (for [y (to-int @(Vector3.y &cmin)) (inc (to-int @(Vector3.y &cmax)))]
+          (for [x (to-int @(Vector3.x &cmin)) (inc (to-int @(Vector3.x &cmax)))]
+            (match (get-index grid x y z)
+              (Maybe.Just idx) (let [bucket (Array.unsafe-nth buckets idx)]
+                                 (match (Array.index-of bucket &id)
+                                   (Maybe.Just i) (do
+                                                    (Array.swap! bucket i (dec (Array.length bucket)))
+                                                    (ignore (Array.pop-back! bucket)))
+                                   (Maybe.Nothing) ()))
+              (Maybe.Nothing) ()))))))
+
+  (doc query "finds all object IDs in buckets overlapping the AABB. May contain duplicates.")
+  (defn query [grid aabb]
+    (let [amin (AABB.min aabb)
+          amax (AABB.max aabb)
+          cmin (pos-to-coord grid amin)
+          cmax (pos-to-coord grid amax)
+          buckets (SpatialGrid.buckets grid)
+          results []]
+      (do
+        (for [z (to-int @(Vector3.z &cmin)) (inc (to-int @(Vector3.z &cmax)))]
+          (for [y (to-int @(Vector3.y &cmin)) (inc (to-int @(Vector3.y &cmax)))]
+            (for [x (to-int @(Vector3.x &cmin)) (inc (to-int @(Vector3.x &cmax)))]
+              (match (get-index grid x y z)
+                (Maybe.Just idx) 
+                (let [bucket (Array.unsafe-nth buckets idx)]
+                  (for [i 0 (Array.length bucket)]
+                    (Array.push-back! &results @(Array.unsafe-nth bucket i))))
+                (Maybe.Nothing) ()))))
+        results)))
+
+  (doc query-sphere "finds all object IDs in buckets overlapping the sphere. May contain duplicates.")
+  (defn query-sphere [grid sphere]
+    (let [center (Sphere.center sphere)
+          r @(Sphere.radius sphere)
+          box (AABB.init (Vector3.sub center &(Vector3.init r r r))
+                         (Vector3.add center &(Vector3.init r r r)))]
+      (query grid &box)))
+
+  (doc query-ray "finds all object IDs in buckets intersected by the ray up to max-t. May contain duplicates.")
+  (defn query-ray [grid ray max-t]
+    (let [cs @(SpatialGrid.cell-size grid)
+          cols @(SpatialGrid.cols grid)
+          rows @(SpatialGrid.rows grid)
+          layers @(SpatialGrid.layers grid)
+          grid-box (AABB.init (Vector3.init 0.0 0.0 0.0) 
+                             (Vector3.init (* (Double.from-int cols) cs)
+                                           (* (Double.from-int rows) cs)
+                                           (* (Double.from-int layers) cs)))]
+      (match (Ray.intersect-aabb ray &grid-box)
+        (Maybe.Nothing) []
+        (Maybe.Just hit)
+        (let [start-t @(RayHit.t &hit)
+              origin (Ray.at ray start-t) ;; Start at grid boundary or origin
+              dir (Ray.direction ray)
+              buckets (SpatialGrid.buckets grid)
+              
+              ;; Ensure start point is slightly inside to avoid precision issues
+              safe-origin (Vector3.add &origin &(Vector3.mul dir Geometry.EPSILON))
+              
+              cx (to-int (floor (/ @(Vector3.x &safe-origin) cs)))
+              cy (to-int (floor (/ @(Vector3.y &safe-origin) cs)))
+              cz (to-int (floor (/ @(Vector3.z &safe-origin) cs)))
+              
+              step-x (if (> @(Vector3.x dir) 0.0) 1 -1)
+              step-y (if (> @(Vector3.y dir) 0.0) 1 -1)
+              step-z (if (> @(Vector3.z dir) 0.0) 1 -1)
+              
+              t-delta-x (if (zero? @(Vector3.x dir)) Double.MAX (abs (/ cs @(Vector3.x dir))))
+              t-delta-y (if (zero? @(Vector3.y dir)) Double.MAX (abs (/ cs @(Vector3.y dir))))
+              t-delta-z (if (zero? @(Vector3.z dir)) Double.MAX (abs (/ cs @(Vector3.z dir))))
+              
+              t-max-x (if (zero? @(Vector3.x dir)) Double.MAX
+                        (if (> @(Vector3.x dir) 0.0)
+                          (/ (- (* (Double.from-int (inc cx)) cs) @(Vector3.x &safe-origin)) @(Vector3.x dir))
+                          (/ (- (* (Double.from-int cx) cs) @(Vector3.x &safe-origin)) @(Vector3.x dir))))
+              t-max-y (if (zero? @(Vector3.y dir)) Double.MAX
+                        (if (> @(Vector3.y dir) 0.0)
+                          (/ (- (* (Double.from-int (inc cy)) cs) @(Vector3.y &safe-origin)) @(Vector3.y dir))
+                          (/ (- (* (Double.from-int cy) cs) @(Vector3.y &safe-origin)) @(Vector3.y dir))))
+              t-max-z (if (zero? @(Vector3.z dir)) Double.MAX
+                        (if (> @(Vector3.z dir) 0.0)
+                          (/ (- (* (Double.from-int (inc cz)) cs) @(Vector3.z &safe-origin)) @(Vector3.z dir))
+                          (/ (- (* (Double.from-int cz) cs) @(Vector3.z &safe-origin)) @(Vector3.z dir))))
+              
+              t-curr start-t
+              results []]
+          (do
+            (while (and (<= t-curr max-t)
+                        (and (and (and (>= cx 0) (< cx cols))
+                                  (and (>= cy 0) (< cy rows)))
+                             (and (>= cz 0) (< cz layers))))
+              (do
+                (let [idx (+ cx (* cols (+ cy (* rows cz))))
+                      bucket (Array.unsafe-nth buckets idx)]
+                  (for [i 0 (Array.length bucket)]
+                    (Array.push-back! &results @(Array.unsafe-nth bucket i))))
+                
+                (if (< t-max-x t-max-y)
+                  (if (< t-max-x t-max-z)
+                    (do (set! t-curr (+ start-t t-max-x)) (set! t-max-x (+ t-max-x t-delta-x)) (set! cx (+ cx step-x)))
+                    (do (set! t-curr (+ start-t t-max-z)) (set! t-max-z (+ t-max-z t-delta-z)) (set! cz (+ cz step-z))))
+                  (if (< t-max-y t-max-z)
+                    (do (set! t-curr (+ start-t t-max-y)) (set! t-max-y (+ t-max-y t-delta-y)) (set! cy (+ cy step-y)))
+                    (do (set! t-curr (+ start-t t-max-z)) (set! t-max-z (+ t-max-z t-delta-z)) (set! cz (+ cz step-z)))))))
+            results)))))
+
+  (defn- unique-results [ids]
+    (let [res []]
+      (do
+        (for [i 0 (Array.length &ids)]
+          (let [id (Array.unsafe-nth &ids i)]
+            (if (Array.contains? &res id)
+              ()
+              (Array.push-back! &res @id))))
+        res)))
+
+  (doc query-unique "finds all unique object IDs in buckets overlapping the AABB.")
+  (defn query-unique [grid aabb]
+    (unique-results (query grid aabb)))
+
+  (doc query-sphere-unique "finds all unique object IDs in buckets overlapping the sphere.")
+  (defn query-sphere-unique [grid sphere]
+    (unique-results (query-sphere grid sphere)))
+
+  (doc query-ray-unique "finds all unique object IDs in buckets intersected by the ray.")
+  (defn query-ray-unique [grid ray max-t]
+    (unique-results (query-ray grid ray max-t)))
+
+  (doc clear! "clears all buckets in the grid.")
+  (defn clear! [grid]
+    (let [buckets (SpatialGrid.buckets grid)]
+      (for [i 0 (Array.length buckets)]
+        (let [bucket (Array.unsafe-nth buckets i)]
+          (while (not (Array.empty? bucket))
+            (ignore (Array.pop-back! bucket)))))))
+)
