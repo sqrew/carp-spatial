@@ -18,14 +18,16 @@
   layers Int
   buckets (Array (Array t))
   overflow (Array t)
+  origin (Vector3 Double)
 ])
 
 (defmodule SpatialGrid
   (defn- pos-to-coord [grid p]
-    (let [cs @(SpatialGrid.cell-size grid)]
-      (Vector3.init (Double.floor (/ @(Vector3.x p) cs))
-                    (Double.floor (/ @(Vector3.y p) cs))
-                    (Double.floor (/ @(Vector3.z p) cs)))))
+    (let [cs @(SpatialGrid.cell-size grid)
+          o (SpatialGrid.origin grid)]
+      (Vector3.init (Double.floor (/ (- @(Vector3.x p) @(Vector3.x o)) cs))
+                    (Double.floor (/ (- @(Vector3.y p) @(Vector3.y o)) cs))
+                    (Double.floor (/ (- @(Vector3.z p) @(Vector3.z o)) cs)))))
 
   (defn- get-range [grid aabb]
     (let [amin (AABB.min aabb)
@@ -52,7 +54,13 @@
     (let [total (* cols (* rows layers))
           ;; Note: We use an empty array literal and cast it to the generic type
           buckets (Array.replicate total &(the (Array t) []))]
-      (SpatialGrid.init cell-size cols rows layers buckets [])))
+      (SpatialGrid.init cell-size cols rows layers buckets [] (Vector3.init 0.0 0.0 0.0))))
+
+  (doc new-with-origin "creates a new SpatialGrid with a custom origin.")
+  (defn new-with-origin [cell-size cols rows layers origin]
+    (let [total (* cols (* rows layers))
+          buckets (Array.replicate total &(the (Array t) []))]
+      (SpatialGrid.init cell-size cols rows layers buckets [] origin)))
 
   (doc length "returns the total number of cells (excluding overflow).")
   (defn length [grid]
@@ -199,10 +207,11 @@ Note: This requires the same AABB that was used for insertion.")
           cols @(SpatialGrid.cols grid)
           rows @(SpatialGrid.rows grid)
           layers @(SpatialGrid.layers grid)
-          grid-box (AABB.init (Vector3.init 0.0 0.0 0.0) 
-                             (Vector3.init (* (Double.from-int cols) cs)
-                                           (* (Double.from-int rows) cs)
-                                           (* (Double.from-int layers) cs)))
+          origin (SpatialGrid.origin grid)
+          grid-box (AABB.init @origin 
+                             (Vector3.init (+ @(Vector3.x origin) (* (Double.from-int cols) cs))
+                                           (+ @(Vector3.y origin) (* (Double.from-int rows) cs))
+                                           (+ @(Vector3.z origin) (* (Double.from-int layers) cs))))
           results []]
       (do
         ;; Always check overflow bucket for ray queries exactly once
@@ -214,16 +223,14 @@ Note: This requires the same AABB that was used for insertion.")
           (Maybe.Nothing) results
           (Maybe.Just hit)
           (let [start-t (max 0.0 @(RayHit.t &hit))
-                origin (Ray.at ray start-t)
+                p-raw (Ray.at ray start-t)
+                p (Vector3.add &p-raw &(Vector3.mul (Ray.direction ray) Geometry.EPSILON))
                 dir (Ray.direction ray)
                 buckets (SpatialGrid.buckets grid)
                 
-                ;; Shift slightly inside to ensure we hit a cell
-                p (Vector3.add &origin &(Vector3.mul dir Geometry.EPSILON))
-                
-                cx (clamp 0 (dec cols) (Double.to-int (Double.floor (/ @(Vector3.x &p) cs))))
-                cy (clamp 0 (dec rows) (Double.to-int (Double.floor (/ @(Vector3.y &p) cs))))
-                cz (clamp 0 (dec layers) (Double.to-int (Double.floor (/ @(Vector3.z &p) cs))))
+                cx (clamp 0 (dec cols) (Double.to-int (Double.floor (/ (- @(Vector3.x &p) @(Vector3.x origin)) cs))))
+                cy (clamp 0 (dec rows) (Double.to-int (Double.floor (/ (- @(Vector3.y &p) @(Vector3.y origin)) cs))))
+                cz (clamp 0 (dec layers) (Double.to-int (Double.floor (/ (- @(Vector3.z &p) @(Vector3.z origin)) cs))))
 
                 dx @(Vector3.x dir) dy @(Vector3.y dir) dz @(Vector3.z dir)
 
@@ -236,13 +243,13 @@ Note: This requires the same AABB that was used for insertion.")
                 t-delta-z (if (< (abs dz) Geometry.EPSILON) Double.MAX (abs (/ cs dz)))
                 
                 t-max-x (if (>= t-delta-x Double.MAX) Double.MAX
-                          (let [boundary (if (> step-x 0) (* (Double.from-int (inc cx)) cs) (* (Double.from-int cx) cs))]
+                          (let [boundary (if (> step-x 0) (+ @(Vector3.x origin) (* (Double.from-int (inc cx)) cs)) (+ @(Vector3.x origin) (* (Double.from-int cx) cs)))]
                             (max 0.0 (/ (- boundary @(Vector3.x &p)) dx))))
                 t-max-y (if (>= t-delta-y Double.MAX) Double.MAX
-                          (let [boundary (if (> step-y 0) (* (Double.from-int (inc cy)) cs) (* (Double.from-int cy) cs))]
+                          (let [boundary (if (> step-y 0) (+ @(Vector3.y origin) (* (Double.from-int (inc cy)) cs)) (+ @(Vector3.y origin) (* (Double.from-int cy) cs)))]
                             (max 0.0 (/ (- boundary @(Vector3.y &p)) dy))))
                 t-max-z (if (>= t-delta-z Double.MAX) Double.MAX
-                          (let [boundary (if (> step-z 0) (* (Double.from-int (inc cz)) cs) (* (Double.from-int cz) cs))]
+                          (let [boundary (if (> step-z 0) (+ @(Vector3.z origin) (* (Double.from-int (inc cz)) cs)) (+ @(Vector3.z origin) (* (Double.from-int cz) cs)))]
                             (max 0.0 (/ (- boundary @(Vector3.z &p)) dz))))
                 
                 t-curr start-t]
