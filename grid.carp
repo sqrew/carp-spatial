@@ -3,6 +3,18 @@
 (use Array)
 (use Double)
 
+(defmodule Uint32Ref
+  (defn > [a b]
+    (Uint32.> @a @b))
+)
+(implements > Uint32Ref.>)
+
+(defmodule Uint64Ref
+  (defn > [a b]
+    (Uint64.> @a @b))
+)
+(implements > Uint64Ref.>)
+
 ;; Helper for coordinate ranges
 (deftype CellRange [
   min-x Int, max-x Int
@@ -10,14 +22,21 @@
   min-z Int, max-z Int
 ])
 
-(doc SpatialGrid "is a 3D spatial partitioning grid with an overflow bucket for out-of-bounds objects.")
+(deftype (GridEntry t) [
+  id t
+  next Int
+])
+
+(doc SpatialGrid "is a 3D spatial partitioning grid represented as a flat allocation-free linked list structure.")
 (deftype (SpatialGrid t) [
   cell-size Double
   cols Int
   rows Int
   layers Int
-  buckets (Array (Array t))
-  overflow (Array t)
+  heads (Array Int)
+  overflow-head Int
+  entries (Array (GridEntry t))
+  entry-count Int
   origin (Vector3 Double)
 ])
 
@@ -52,48 +71,110 @@
   (doc new "creates a new SpatialGrid.")
   (defn new [cell-size cols rows layers]
     (let [total (* cols (* rows layers))
-          ;; Note: We use an empty array literal and cast it to the generic type
-          buckets (Array.replicate total &(the (Array t) []))]
-      (SpatialGrid.init cell-size cols rows layers buckets [] (Vector3.init 0.0 0.0 0.0))))
+          heads (Array.replicate total &-1)
+          entries (the (Array (GridEntry t)) [])]
+      (SpatialGrid.init cell-size cols rows layers heads -1 entries 0 (Vector3.init 0.0 0.0 0.0))))
 
   (doc new-with-origin "creates a new SpatialGrid with a custom origin.")
   (defn new-with-origin [cell-size cols rows layers origin]
     (let [total (* cols (* rows layers))
-          buckets (Array.replicate total &(the (Array t) []))]
-      (SpatialGrid.init cell-size cols rows layers buckets [] origin)))
+          heads (Array.replicate total &-1)
+          entries (the (Array (GridEntry t)) [])]
+      (SpatialGrid.init cell-size cols rows layers heads -1 entries 0 origin)))
 
-  (doc length "returns the total number of cells (excluding overflow).")
+  (doc length "returns the total number of cells.")
   (defn length [grid]
     (* @(SpatialGrid.cols grid) (* @(SpatialGrid.rows grid) @(SpatialGrid.layers grid))))
 
-  (doc empty? "checks whether all buckets (including overflow) are empty.")
+  (sig cell-contains? (Fn [(Ref (SpatialGrid t)) Int (Ref t)] Bool))
+  (defn- cell-contains? [grid cell-head id-ref]
+    (let [curr cell-head
+          found false
+          entries (SpatialGrid.entries grid)]
+      (do
+        (while (not (= curr -1))
+          (let [entry (Array.unsafe-nth entries curr)]
+            (if (= (GridEntry.id entry) id-ref)
+              (do (set! found true) (break))
+              (set! curr @(GridEntry.next entry)))))
+        found)))
+
+  (sig add-entry! (Fn [(Ref (SpatialGrid t)) t Int] Int))
+  (defn- add-entry! [grid id next-idx]
+    (let [entries (SpatialGrid.entries grid)
+          count @(SpatialGrid.entry-count grid)
+          capacity (Array.length entries)
+          entry (GridEntry.init id next-idx)]
+      (do
+        (if (>= count capacity)
+          (Array.push-back! entries entry)
+          (Array.aset! entries count entry))
+        (SpatialGrid.set-entry-count! grid (inc count))
+        count)))
+
+  (sig push-to-cell! (Fn [(Ref (SpatialGrid t)) Int (Ref t)] ()))
+  (defn- push-to-cell! [grid cell-idx id-ref]
+    (let [heads (SpatialGrid.heads grid)
+          head @(Array.unsafe-nth heads cell-idx)]
+      (if (cell-contains? grid head id-ref)
+        ()
+        (let [entry-idx (add-entry! grid @id-ref head)]
+          (Array.aset! heads cell-idx entry-idx)))))
+
+  (sig push-to-overflow! (Fn [(Ref (SpatialGrid t)) (Ref t)] ()))
+  (defn- push-to-overflow! [grid id-ref]
+    (let [head @(SpatialGrid.overflow-head grid)]
+      (if (cell-contains? grid head id-ref)
+        ()
+        (let [entry-idx (add-entry! grid @id-ref head)]
+          (SpatialGrid.set-overflow-head! grid entry-idx)))))
+
+  (sig cell-remove-id! (Fn [(Ref (SpatialGrid t)) Int (Ref t)] ()))
+  (defn- cell-remove-id! [grid cell-idx id-ref]
+    (let [heads (SpatialGrid.heads grid)
+          entries (SpatialGrid.entries grid)
+          curr @(Array.unsafe-nth heads cell-idx)
+          prev -1]
+      (while (not (= curr -1))
+        (let [entry (Array.unsafe-nth entries curr)]
+          (if (= (GridEntry.id entry) id-ref)
+            (let [next-idx @(GridEntry.next entry)]
+              (do
+                (if (= prev -1)
+                  (Array.aset! heads cell-idx next-idx)
+                  (let [prev-entry (Array.unsafe-nth entries prev)]
+                    (GridEntry.set-next! prev-entry next-idx)))
+                (break)))
+            (do
+              (set! prev curr)
+              (set! curr @(GridEntry.next entry))))))))
+
+  (sig overflow-remove-id! (Fn [(Ref (SpatialGrid t)) (Ref t)] ()))
+  (defn- overflow-remove-id! [grid id-ref]
+    (let [entries (SpatialGrid.entries grid)
+          curr @(SpatialGrid.overflow-head grid)
+          prev -1]
+      (while (not (= curr -1))
+        (let [entry (Array.unsafe-nth entries curr)]
+          (if (= (GridEntry.id entry) id-ref)
+            (let [next-idx @(GridEntry.next entry)]
+              (do
+                (if (= prev -1)
+                  (SpatialGrid.set-overflow-head! grid next-idx)
+                  (let [prev-entry (Array.unsafe-nth entries prev)]
+                    (GridEntry.set-next! prev-entry next-idx)))
+                (break)))
+            (do
+              (set! prev curr)
+              (set! curr @(GridEntry.next entry))))))))
+
+  (doc empty? "checks whether grid is empty.")
   (defn empty? [grid]
-    (if (not (Array.empty? (SpatialGrid.overflow grid)))
-      false
-      (let [buckets (SpatialGrid.buckets grid)
-            res true]
-        (do
-          (for [i 0 (Array.length buckets)]
-            (when (not (Array.empty? (Array.unsafe-nth buckets i)))
-              (do (set! res false) (break))))
-          res))))
-
-  (defn- bucket-push! [bucket id]
-    (if (Array.contains? bucket &id)
-      ()
-      (Array.push-back! bucket id)))
-
-  (defn- bucket-remove! [bucket id]
-    (match (Array.index-of bucket &id)
-      (Maybe.Just i) (do (Array.swap! bucket i (dec (Array.length bucket)))
-                         (ignore (Array.pop-back! bucket)))
-      (Maybe.Nothing) ()))
+    (= @(SpatialGrid.entry-count grid) 0))
 
   (doc insert! "inserts an object ID into the grid buckets overlapping the AABB.")
   (defn insert! [grid aabb id]
     (let [r (get-range grid aabb)
-          buckets (SpatialGrid.buckets grid)
-          ov (SpatialGrid.overflow grid)
           cols @(SpatialGrid.cols grid)
           rows @(SpatialGrid.rows grid)
           layers @(SpatialGrid.layers grid)
@@ -102,7 +183,8 @@
           y-start @(CellRange.min-y &r)
           y-end (inc @(CellRange.max-y &r))
           x-start @(CellRange.min-x &r)
-          x-end (inc @(CellRange.max-x &r))]
+          x-end (inc @(CellRange.max-x &r))
+          id-ref &id]
       (while (< z z-end)
         (do
           (let [y y-start]
@@ -114,18 +196,15 @@
                       (if (and (and (and (>= x 0) (< x cols))
                                     (and (>= y 0) (< y rows)))
                                (and (>= z 0) (< z layers)))
-                        (bucket-push! (Array.unsafe-nth buckets (+ x (* cols (+ y (* rows z))))) id)
-                        (bucket-push! ov id))
+                        (push-to-cell! grid (+ x (* cols (+ y (* rows z)))) id-ref)
+                        (push-to-overflow! grid id-ref))
                       (set! x (inc x)))))
                 (set! y (inc y)))))
           (set! z (inc z))))))
 
-  (doc remove! "removes an object ID from all buckets overlapping the AABB (and overflow).
-Note: This requires the same AABB that was used for insertion.")
+  (doc remove! "removes an object ID from all buckets overlapping the AABB (and overflow).")
   (defn remove! [grid aabb id]
     (let [r (get-range grid aabb)
-          ov (SpatialGrid.overflow grid)
-          buckets (SpatialGrid.buckets grid)
           cols @(SpatialGrid.cols grid)
           rows @(SpatialGrid.rows grid)
           layers @(SpatialGrid.layers grid)
@@ -134,7 +213,8 @@ Note: This requires the same AABB that was used for insertion.")
           y-start @(CellRange.min-y &r)
           y-end (inc @(CellRange.max-y &r))
           x-start @(CellRange.min-x &r)
-          x-end (inc @(CellRange.max-x &r))]
+          x-end (inc @(CellRange.max-x &r))
+          id-ref &id]
       (do
         (while (< z z-end)
           (do
@@ -147,21 +227,22 @@ Note: This requires the same AABB that was used for insertion.")
                         (if (and (and (and (>= x 0) (< x cols))
                                       (and (>= y 0) (< y rows)))
                                  (and (>= z 0) (< z layers)))
-                          (bucket-remove! (Array.unsafe-nth buckets (+ x (* cols (+ y (* rows z))))) id)
+                          (cell-remove-id! grid (+ x (* cols (+ y (* rows z)))) id-ref)
                           ())
                         (set! x (inc x)))))
                   (set! y (inc y)))))
             (set! z (inc z))))
-        (bucket-remove! ov id))))
+        (overflow-remove-id! grid id-ref))))
 
   (doc query "finds all object IDs in buckets overlapping the AABB. May contain duplicates.")
   (defn query [grid aabb]
     (let [r (get-range grid aabb)
-          buckets (SpatialGrid.buckets grid)
+          heads (SpatialGrid.heads grid)
+          entries (SpatialGrid.entries grid)
           cols @(SpatialGrid.cols grid)
           rows @(SpatialGrid.rows grid)
           layers @(SpatialGrid.layers grid)
-          ov (SpatialGrid.overflow grid)
+          ov-head @(SpatialGrid.overflow-head grid)
           results []
           z @(CellRange.min-z &r)
           z-end (inc @(CellRange.max-z &r))
@@ -181,16 +262,23 @@ Note: This requires the same AABB that was used for insertion.")
                         (if (and (and (and (>= x 0) (< x cols))
                                       (and (>= y 0) (< y rows)))
                                  (and (>= z 0) (< z layers)))
-                          (let [bucket (Array.unsafe-nth buckets (+ x (* cols (+ y (* rows z)))))]
-                            (for [i 0 (Array.length bucket)]
-                              (Array.push-back! &results @(Array.unsafe-nth bucket i))))
-                          ()) ;; Overflow handled outside the loop once
+                          (let [curr @(Array.unsafe-nth heads (+ x (* cols (+ y (* rows z)))))]
+                            (while (not (= curr -1))
+                              (let [entry (Array.unsafe-nth entries curr)]
+                                (do
+                                  (Array.push-back! &results @(GridEntry.id entry))
+                                  (set! curr @(GridEntry.next entry))))))
+                          ())
                         (set! x (inc x)))))
                   (set! y (inc y)))))
             (set! z (inc z))))
         ;; Append overflow results exactly once
-        (for [i 0 (Array.length ov)]
-          (Array.push-back! &results @(Array.unsafe-nth ov i)))
+        (let [curr ov-head]
+          (while (not (= curr -1))
+            (let [entry (Array.unsafe-nth entries curr)]
+              (do
+                (Array.push-back! &results @(GridEntry.id entry))
+                (set! curr @(GridEntry.next entry))))))
         results)))
 
   (doc query-sphere-broadphase "finds all object IDs in buckets overlapping the sphere's AABB.")
@@ -215,9 +303,14 @@ Note: This requires the same AABB that was used for insertion.")
           results []]
       (do
         ;; Always check overflow bucket for ray queries exactly once
-        (let [ov (SpatialGrid.overflow grid)]
-          (for [i 0 (Array.length ov)]
-            (Array.push-back! &results @(Array.unsafe-nth ov i))))
+        (let [ov-head @(SpatialGrid.overflow-head grid)
+              entries (SpatialGrid.entries grid)
+              curr ov-head]
+          (while (not (= curr -1))
+            (let [entry (Array.unsafe-nth entries curr)]
+              (do
+                (Array.push-back! &results @(GridEntry.id entry))
+                (set! curr @(GridEntry.next entry))))))
             
         (match (Ray.intersect-aabb ray &grid-box)
           (Maybe.Nothing) results
@@ -226,7 +319,8 @@ Note: This requires the same AABB that was used for insertion.")
                 p-raw (Ray.at ray start-t)
                 p (Vector3.add &p-raw &(Vector3.mul (Ray.direction ray) Geometry.EPSILON))
                 dir (Ray.direction ray)
-                buckets (SpatialGrid.buckets grid)
+                heads (SpatialGrid.heads grid)
+                entries (SpatialGrid.entries grid)
                 
                 cx (clamp 0 (dec cols) (Double.to-int (Double.floor (/ (- @(Vector3.x &p) @(Vector3.x origin)) cs))))
                 cy (clamp 0 (dec rows) (Double.to-int (Double.floor (/ (- @(Vector3.y &p) @(Vector3.y origin)) cs))))
@@ -252,17 +346,23 @@ Note: This requires the same AABB that was used for insertion.")
                           (let [boundary (if (> step-z 0) (+ @(Vector3.z origin) (* (Double.from-int (inc cz)) cs)) (+ @(Vector3.z origin) (* (Double.from-int cz) cs)))]
                             (max 0.0 (/ (- boundary @(Vector3.z &p)) dz))))
                 
-                t-curr start-t]
+                t-curr start-t
+                loop-cnt 0]
             (do
-              (while (and (<= t-curr max-t)
-                          (and (and (and (>= cx 0) (< cx cols))
-                                    (and (>= cy 0) (< cy rows)))
-                               (and (>= cz 0) (< cz layers))))
+              (while (and (< loop-cnt 1000)
+                          (and (<= t-curr max-t)
+                               (and (and (and (>= cx 0) (< cx cols))
+                                         (and (>= cy 0) (< cy rows)))
+                                    (and (>= cz 0) (< cz layers)))))
                 (do
+                  (set! loop-cnt (inc loop-cnt))
                   (let [idx (+ cx (* cols (+ cy (* rows cz))))
-                        bucket (Array.unsafe-nth buckets idx)]
-                    (for [i 0 (Array.length bucket)]
-                      (Array.push-back! &results @(Array.unsafe-nth bucket i))))
+                        curr @(Array.unsafe-nth heads idx)]
+                    (while (not (= curr -1))
+                      (let [entry (Array.unsafe-nth entries curr)]
+                        (do
+                          (Array.push-back! &results @(GridEntry.id entry))
+                          (set! curr @(GridEntry.next entry))))))
                   
                   (if (< t-max-x t-max-y)
                     (if (< t-max-x t-max-z)
@@ -273,16 +373,23 @@ Note: This requires the same AABB that was used for insertion.")
                       (do (set! t-curr (+ start-t t-max-z)) (set! t-max-z (+ t-max-z t-delta-z)) (set! cz (+ cz step-z)))))))
               results))))))
 
-  (doc unique-results "Helper to remove duplicates from a list of IDs. O(n^2) currently, use with caution.")
+  (doc unique-results "Helper to remove duplicates from a list of IDs. O(n log n) heapsort-based implementation.")
   (defn unique-results [ids]
-    (let [res []]
-      (do
-        (for [i 0 (Array.length &ids)]
-          (let [id (Array.unsafe-nth &ids i)]
-            (if (Array.contains? &res id)
-              ()
-              (Array.push-back! &res @id))))
-        res)))
+    (let [len (Array.length &ids)]
+      (if (= len 0)
+        []
+        (let [sorted (Array.sort ids)
+              res []
+              last-val @(Array.unsafe-nth &sorted 0)]
+          (do
+            (Array.push-back! &res last-val)
+            (for [i 1 len]
+              (let [curr @(Array.unsafe-nth &sorted i)]
+                (when (not (= curr last-val))
+                  (do
+                    (Array.push-back! &res curr)
+                    (set! last-val curr)))))
+            res)))))
 
   (doc query-unique "finds all unique object IDs in buckets overlapping the AABB.")
   (defn query-unique [grid aabb]
@@ -296,15 +403,21 @@ Note: This requires the same AABB that was used for insertion.")
   (defn query-ray-unique [grid ray max-t]
     (unique-results (query-ray-broadphase grid ray max-t)))
 
+  (deftemplate heads-clear! (Fn [(Ref (Array Int))] ())
+    "void $NAME(Array *heads)"
+    "$DECL {
+       if (heads->data) {
+           int *data = (int*)heads->data;
+           for (size_t i = 0; i < heads->len; i++) {
+               data[i] = -1;
+           }
+       }
+    }")
+
   (doc clear! "clears all buckets in the grid.")
   (defn clear! [grid]
-    (let [buckets (SpatialGrid.buckets grid)
-          ov (SpatialGrid.overflow grid)]
-      (do
-        (for [i 0 (Array.length buckets)]
-          (let [bucket (Array.unsafe-nth buckets i)]
-            (while (not (Array.empty? bucket))
-              (ignore (Array.pop-back! bucket)))))
-        (while (not (Array.empty? ov))
-          (ignore (Array.pop-back! ov))))))
+    (do
+      (heads-clear! (SpatialGrid.heads grid))
+      (SpatialGrid.set-overflow-head! grid -1)
+      (SpatialGrid.set-entry-count! grid 0)))
 )
